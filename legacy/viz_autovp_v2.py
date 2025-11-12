@@ -1,0 +1,643 @@
+# viz_autovp2.py
+# -*- coding: utf-8 -*-
+"""
+중앙 관제(경로/시간 예약) + SimPy 시뮬 + 층별 애니메이션(GIF)
+- 통행 가능 셀: '0','G','R','-','|'  (모두 그래프 노드)
+- 연결 규칙(셀 단위):
+    * G/R ↔(수평) '-' 만
+    * '-' ↔(수평) G/R/-/0/| , (수직) 연결 금지
+    * '|' ↔(수직) |/0 , (수평) '-' 만  (코너 허용)
+    * '0' ↔ 좌우 '-' , 상하 '|'
+- 경로 탐색: 입차는 (0|-| + 목표 G), 출차는 (0|-| + 자기 R) 서브그래프
+- 색칠: 초기 문자를 보존하고, t 시점에 점유 중인 셀만 R로 칠함(프레임 일관)
+"""
+
+import io
+import math
+import random
+from collections import defaultdict
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import simpy
+from PIL import Image
+
+# ===== 파라미터 =====
+random.seed(42)
+EDGE_TRAVEL_TIME = 1.0        # 셀 1칸 이동 시간(초)
+ARRIVAL_GAP       = 1.0       # 차량 도착 간격(초)
+REPLAN_DELAY      = 3.0       # 예약 실패 시 재시도(초)
+PARK_TIME_RANGE   = (36, 48)   # 쇼핑 체류(초)
+SIM_TIME          = 240.0     # 최대 시뮬레이션 시간 상한(초)
+DT                = 1.0       # GIF 프레임 샘플링 간격(초)
+
+FLOOR_CATEGORY = {"B1": "food", "B2": "fashion"}
+
+ASCII_MAP = [
+    "0-----0-----0",
+    "|-R R-|-R R-|",
+    "|-R G-|-R G-|",
+    "|-R G-|-G G-|",
+    "|-G R-|-G G-|",
+    "0-----0-----0",
+    "|-R R-|-R R-|",
+    "|-R G-|-R G-|",
+    "|-R G-|-G G-|",
+    "|-R R-|-G R-|",
+    "0-----0-----0",
+]
+
+TRAV = set("0GR-|")  # 통행 가능한 문자
+
+# ===== 그래프 빌더 (방향 제약) =====
+def build_grid_graph(lines):
+    H = len(lines)
+    W = max(len(r) for r in lines)
+    lines = [r + " " * (W - len(r)) for r in lines]
+
+    G = nx.Graph()
+    def nid(i, j): return f"N{i}_{j}"
+
+    # 노드 생성
+    for i in range(H):
+        for j in range(W):
+            c = lines[i][j]
+            if c in TRAV:
+                G.add_node(nid(i, j), ch=c, ij=(i, j))
+
+    # 문자 × 방향 규칙
+    def can_connect(ch_from, ch_to, direction):
+        # direction: 'R'(오른쪽), 'D'(아래) — 반대방향은 중복 방지
+        if direction == 'R':
+            if ch_from in {'G','R'} and ch_to == '-': return True       # G/R → -
+            if ch_from == '-' and ch_to in {'G','R','-','0','|'}: return True  # - → (수평)
+            if ch_from == '0' and ch_to == '-': return True             # 0 → -
+            if ch_from == '|' and ch_to == '-': return True             # | → - (코너)
+            return False
+        if direction == 'D':
+            if ch_from == '|' and ch_to in {'|','0'}: return True       # | → |/0
+            if ch_from == '0' and ch_to == '|': return True             # 0 → |
+            return False
+        return False
+
+    # 간선 생성 (우/하만 추가)
+    for i in range(H):
+        for j in range(W):
+            ch = lines[i][j]
+            if ch not in TRAV: 
+                continue
+            u = nid(i, j)
+
+            # 오른쪽
+            if j+1 < W:
+                chR = lines[i][j+1]
+                if chR in TRAV and can_connect(ch, chR, 'R'):
+                    v = nid(i, j+1)
+                    G.add_edge(u, v)
+
+            # 아래
+            if i+1 < H:
+                chD = lines[i+1][j]
+                if chD in TRAV and can_connect(ch, chD, 'D'):
+                    v = nid(i+1, j)
+                    G.add_edge(u, v)
+
+    return G
+
+def find_nodes(G, ch):
+    return [n for n, d in G.nodes(data=True) if d.get("ch") == ch]
+
+# ===== 서브그래프 (입/출차 통행 허용 집합 제한) =====
+def build_route_subgraph(G, src=None, dst=None):
+    """
+    - 항상 허용: '0','-','|'
+    - 입차: dst(목표 G)만 추가 허용
+    - 출차: src(자기 R)만 추가 허용
+    그 외 모든 G/R은 제외 → 통과 불가
+    """
+    base_allow = {'0','-','|'}
+    allowed = set(n for n,d in G.nodes(data=True) if d['ch'] in base_allow)
+    if src is not None:
+        allowed.add(src)
+    if dst is not None:
+        allowed.add(dst)
+    return G.subgraph(allowed).copy()
+
+# ===== 경로 탐색(A*) =====
+def astar_path_on(Gx, s, t):
+    def xy(n): return Gx.nodes[n]["ij"]
+    def h(a, b):
+        (ai,aj),(bi,bj) = xy(a), xy(b)
+        return abs(ai-bi)+abs(aj-bj)
+    try:
+        return nx.astar_path(Gx, s, t, heuristic=h, weight=None)
+    except nx.NetworkXNoPath:
+        return None
+
+def path_edges_with_duration(path_nodes):
+    return [(u,v,EDGE_TRAVEL_TIME) for u,v in zip(path_nodes[:-1], path_nodes[1:])]
+
+# ===== 예약 테이블 =====
+class ReservationTable:
+    def __init__(self):
+        self.book_edge = defaultdict(list)  # edge_key -> [(t0,t1,vid)]
+        self.book_node = defaultdict(list)  # node -> [(t0,t1,vid)]
+
+    @staticmethod
+    def ek(u, v): 
+        return tuple(sorted((u, v)))
+
+    def can_use_edge(self, ek, t0, t1):
+        for (a, b, _) in self.book_edge[ek]:
+            if not (t1 <= a or b <= t0):
+                return False
+        return True
+
+    def can_use_node(self, node, t0, t1):
+        for (a, b, _) in self.book_node[node]:
+            if not (t1 <= a or b <= t0):
+                return False
+        return True
+
+    def reserve_segments(self, segments, start_t, vid):
+        """엣지·노드 모두 시간 충돌 검사"""
+        t = start_t
+        temp_edges, temp_nodes = [], []
+        for (u, v, dur) in segments:
+            ek = self.ek(u, v)
+            t0, t1 = t, t + dur
+            # 엣지 및 목적 노드 점유 확인
+            if not self.can_use_edge(ek, t0, t1):
+                return None
+            # 노드 v를 t1 근처까지 점유
+            node_margin = 0.2 * dur
+            if not self.can_use_node(v, t1 - node_margin, t1 + node_margin):
+                return None
+            temp_edges.append((ek, t0, t1, (u, v)))
+            temp_nodes.append((v, t1 - node_margin, t1 + node_margin))
+            t = t1
+
+        # 충돌 없으면 예약 확정
+        for ek, t0, t1, _ in temp_edges:
+            self.book_edge[ek].append((t0, t1, vid))
+        for v, t0, t1 in temp_nodes:
+            self.book_node[v].append((t0, t1, vid))
+        return temp_edges
+
+# ===== 관제/차량 =====
+class ControlTower:
+    def __init__(self, env, floors):
+        self.env = env
+        self.floors = floors          # {"B1": (G, entrance), ...}
+        self.resv = ReservationTable()
+        self.traj = {"B1": [], "B2": []}   # 차량 이동/정지 세그먼트
+        # 🔴 점유 구간(층별): spot -> [(t0,t1)]
+        self.occ = {"B1": defaultdict(list), "B2": defaultdict(list)}
+        self.claimed = {"B1": set(), "B2": set()}  # 스팟 선점: {(node_id), ...}
+
+        # 초기 R은 0~∞ 점유로 등록 (시작 색 정확히 반영)
+        for fid, (G, _) in floors.items():
+            for n in find_nodes(G, "R"):
+                self.occ[fid][n].append((0.0, math.inf))
+
+    def spot_candidates(self, fid):
+        G, _ = self.floors[fid]
+        now = self.env.now
+        out = []
+        for sp in find_nodes(G, "G"):
+            if sp in self.claimed[fid]:
+                continue
+            if self.is_occupied_now(fid, sp, now):
+                continue
+            out.append(sp)
+        return out
+
+    def pick_spot(self, pref):
+        """층 선호도 × 경로 길이로 간단 점수화."""
+        best = None
+        best_score = -1e18
+        for fid, (G, entr) in self.floors.items():
+            w_floor = pref.get(FLOOR_CATEGORY[fid], 0.0)
+            for sp in self.spot_candidates(fid):
+                SG = build_route_subgraph(G, src=None, dst=sp)
+                p = astar_path_on(SG, entr, sp)
+                if not p: 
+                    continue
+                travel = (len(p)-1) * EDGE_TRAVEL_TIME
+                score = -travel * w_floor + 0.1
+                if score > best_score:
+                    best_score = score
+                    best = (fid, sp, travel)
+        return best
+
+    def reserve(self, fid, path_nodes, vid):
+        G, _ = self.floors[fid]
+        segs = path_edges_with_duration(path_nodes)
+        details = self.resv.reserve_segments(segs, self.env.now, vid)
+        if details is None:
+            return None
+        # 시각화용 기록
+        for _, t0, t1, (u, v) in details:
+            ui, uj = G.nodes[u]["ij"]; vi, vj = G.nodes[v]["ij"]
+            self.traj[fid].append({
+                "vid": vid, "t0": t0, "t1": t1,
+                "ui": ui, "uj": uj, "vi": vi, "vj": vj
+            })
+        return details
+
+    # 점유 구간 추가
+    def add_occupancy(self, fid, spot, t0, t1):
+        self.occ[fid][spot].append((t0, t1))
+    
+    
+    def is_occupied_now(self, fid, spot, t_now):
+        """occ 테이블 기준으로 지금 시각에 점유 중인지 검사"""
+        for (a, b) in self.occ[fid].get(spot, []):
+            if a <= t_now <= b:
+                return True
+        return False
+
+    def try_claim(self, fid, spot, t_now):
+        """점유 중/선점 중이면 실패, 아니면 선점하고 True"""
+        if self.is_occupied_now(fid, spot, t_now):
+            return False
+        if spot in self.claimed[fid]:
+            return False
+        self.claimed[fid].add(spot)
+        return True
+
+    def unclaim(self, fid, spot):
+        self.claimed[fid].discard(spot)
+
+class Vehicle:
+    def __init__(self, env, vid, tower, pref, logs):
+        self.env = env
+        self.vid = vid
+        self.tower = tower
+        self.pref = pref
+        self.logs = logs
+        env.process(self.run())
+
+    def L(self, msg):
+        line = f"[T={self.env.now:6.1f}] car#{self.vid:<2d} {msg}"
+        self.logs.append(line)
+        print(line)
+
+    def run(self):
+        pick = self.tower.pick_spot(self.pref)
+        if not pick:
+            self.L("배정 가능한 스팟이 없습니다. 종료")
+            return
+
+        fid, spot, _ = pick
+        G, entr = self.tower.floors[fid]
+        self.L(f"배정 층={fid}, 입구={entr}, 스팟={spot}")
+
+        # ✅ 선택 직후 즉시 선점 (경합 차단)
+        if not self.tower.try_claim(fid, spot, self.env.now):
+            self.L("스팟 선점 실패(동시 경합) → 재탐색")
+            while True:
+                new_pick = self.tower.pick_spot(self.pref)
+                if not new_pick:
+                    self.L("배정 가능한 스팟 없음 → 대기 후 재시도")
+                    yield self.env.timeout(REPLAN_DELAY)
+                    continue
+                fid, spot, _ = new_pick
+                G, entr = self.tower.floors[fid]
+                self.L(f"재배정 층={fid}, 스팟={spot}")
+                if self.tower.try_claim(fid, spot, self.env.now):
+                    break
+                else:
+                    self.L("재배정 스팟도 선점 실패 → 반복")
+
+        # 입차
+        while True:
+            SG_in = build_route_subgraph(G, src=None, dst=spot)
+            path  = astar_path_on(SG_in, entr, spot)
+            if not path:
+                self.L("입차 경로 없음 → 선점 해제 후 재시도")
+                self.tower.unclaim(fid, spot)
+                yield self.env.timeout(REPLAN_DELAY)
+                # 재탐색 + 즉시 선점 재시도
+                while True:
+                    new_pick = self.tower.pick_spot(self.pref)
+                    if not new_pick:
+                        self.L("배정 가능한 스팟 없음 → 대기 후 재시도")
+                        yield self.env.timeout(REPLAN_DELAY)
+                        continue
+                    fid, spot, _ = new_pick
+                    G, entr = self.tower.floors[fid]
+                    self.L(f"재배정 층={fid}, 스팟={spot}")
+                    if self.tower.try_claim(fid, spot, self.env.now):
+                        break
+                continue
+
+            det = self.tower.reserve(fid, path, self.vid)
+            if det is None:
+                self.L("입차 예약 충돌 → 선점 해제 후 대기")
+                self.tower.unclaim(fid, spot)
+                yield self.env.timeout(REPLAN_DELAY)
+                # 재탐색 + 즉시 선점 재시도
+                while True:
+                    new_pick = self.tower.pick_spot(self.pref)
+                    if not new_pick:
+                        self.L("배정 가능한 스팟 없음 → 대기 후 재시도")
+                        yield self.env.timeout(REPLAN_DELAY)
+                        continue
+                    fid, spot, _ = new_pick
+                    G, entr = self.tower.floors[fid]
+                    self.L(f"재배정 층={fid}, 스팟={spot}")
+                    if self.tower.try_claim(fid, spot, self.env.now):
+                        break
+                continue
+
+            travel = sum(t1 - t0 for _, t0, t1, _ in det)
+            self.L(f"입차 이동 시작 (예상 {travel:.1f}s)")
+            yield self.env.timeout(travel)
+            break
+
+        # 주차(정지 세그먼트 + 점유 구간 기록)
+        park_start = self.env.now
+        dwell = random.randint(*PARK_TIME_RANGE)
+        self.L(f"체류 시작 ({dwell}s)")
+
+        si, sj = G.nodes[spot]["ij"]
+        self.tower.traj[fid].append({
+            "vid": self.vid, "t0": park_start, "t1": park_start + dwell,
+            "ui": si, "uj": sj, "vi": si, "vj": sj
+        })
+        self.tower.add_occupancy(fid, spot, park_start, park_start + dwell)
+        yield self.env.timeout(dwell)
+
+        # 출차
+        self.L("출차 요청")
+        while True:
+            SG_out = build_route_subgraph(G, src=spot, dst=entr)
+            path = astar_path_on(SG_out, spot, entr)
+            if not path:
+                self.L("출차 경로 없음 → 재시도")
+                yield self.env.timeout(REPLAN_DELAY); continue
+            det = self.tower.reserve(fid, path, self.vid)
+            if det is None:
+                self.L("출차 예약 충돌 → 대기")
+                yield self.env.timeout(REPLAN_DELAY); continue
+            travel = sum(t1 - t0 for _, t0, t1, _ in det)
+            self.L(f"출차 이동 시작 (예상 {travel:.1f}s)")
+            yield self.env.timeout(travel)
+            break
+
+        self.tower.unclaim(fid, spot) 
+        self.L("출구 도착 / 스팟 해제")
+
+# ===== 도착 프로세스 =====
+def arrival(env, tower, logs):
+    vid = 0
+    while True:
+        vid += 1
+        pref = {"food": 0.7, "fashion": 0.3} if vid % 2 == 1 else {"food": 0.3, "fashion": 0.7}
+        Vehicle(env, vid, tower, pref, logs)
+        yield env.timeout(ARRIVAL_GAP)
+
+# ===== 레이아웃 디버그(선택) =====
+def debug_dump_floor(fid, G):
+    zeros = [(n, G.nodes[n]["ij"]) for n in find_nodes(G, "0")]
+    greens = [(n, G.nodes[n]["ij"]) for n in find_nodes(G, "G")]
+    reds   = [(n, G.nodes[n]["ij"]) for n in find_nodes(G, "R")]
+    print(f"[{fid}] count -> 0:{len(zeros)}  G:{len(greens)}  R:{len(reds)}")
+    g_row1 = [ij for _,ij in greens if ij[0]==1]
+    r_row1 = [ij for _,ij in reds   if ij[0]==1]
+    print(f"[{fid}] row1 G: {sorted(g_row1)}")
+    print(f"[{fid}] row1 R: {sorted(r_row1)}")
+
+def save_layout_png(fid, G, out_path):
+    coords = [G.nodes[n]["ij"] for n in G.nodes]
+    max_i = max(i for i, j in coords); max_j = max(j for i, j in coords)
+    fig = plt.figure(figsize=(8,6)); ax = plt.gca()
+    ax.set_aspect("equal")
+    ax.set_xlim(-0.5, max_j + 1.5); ax.set_ylim(max_i + 1.5, -0.5)
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_title(f"{fid} layout t=0")
+
+    for n in G.nodes:
+        i, j = G.nodes[n]["ij"]; ch = G.nodes[n]["ch"]
+        if ch == "0": fc=(0.82,0.86,1.00)
+        elif ch == "G": fc=(0.85,1.00,0.85)
+        elif ch == "R": fc=(1.00,0.85,0.85)
+        else: fc=(1,1,1)
+        ax.add_patch(plt.Rectangle((j,i),1,1,facecolor=fc,edgecolor='0.85',linewidth=0.8))
+        ax.text(j+0.5, i+0.55, ch, ha="center", va="center", fontsize=8, alpha=0.85)
+
+    # G/R에 닿는 간선은 생략(시각적으로 ASCII와 더 유사)
+    for u, v in G.edges():
+        cu = G.nodes[u]["ch"]; cv = G.nodes[v]["ch"]
+        if cu in {"G","R"} or cv in {"G","R"}: 
+            continue
+        ui, uj = G.nodes[u]["ij"]; vi, vj = G.nodes[v]["ij"]
+        ax.plot([uj+0.5, vj+0.5], [ui+0.5, vi+0.5], linewidth=1.2, alpha=0.35, color="k")
+
+    fig.savefig(out_path, bbox_inches="tight"); plt.close(fig)
+    print(f"[ok] saved {out_path}")
+
+# ===== 시각화 =====
+def render_floor_gif(fid, floor, segments, sim_time, dt, out_path, occ=None):
+    G, entr = floor
+    coords = [G.nodes[n]["ij"] for n in G.nodes]
+    max_i = max(i for i, j in coords); max_j = max(j for i, j in coords)
+
+    frames = []
+    t = 0.0
+    while t <= sim_time + 1e-6:
+        fig = plt.figure(figsize=(8, 6)); ax = plt.gca()
+        ax.set_aspect("equal")
+        ax.set_xlim(-0.5, max_j + 1.5); ax.set_ylim(max_i + 1.5, -0.5)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"{fid}  t={int(t)}s")
+
+        # 타일 (0/G/R만 색) — ch는 초기문자, occ로 t 시점 점유 반영
+        for n in G.nodes:
+            i, j = G.nodes[n]["ij"]
+            base = G.nodes[n]["ch"]
+            # t 시점 점유 여부
+            occupied_now = False
+            if base in {"G","R"} and occ is not None:
+                for (a, b) in occ.get(n, []):
+                    if a <= t <= b:
+                        occupied_now = True
+                        break
+            ch_for_paint = "R" if occupied_now else base
+
+            if ch_for_paint == "0":    fc=(0.82,0.86,1.00)
+            elif ch_for_paint == "G":  fc=(0.85,1.00,0.85)
+            elif ch_for_paint == "R":  fc=(1.00,0.85,0.85)
+            else:                      fc=(1,1,1)
+            ax.add_patch(plt.Rectangle((j,i),1,1,facecolor=fc,edgecolor='0.85',linewidth=0.8))
+            ax.text(j+0.5, i+0.55, base, ha="center", va="center", fontsize=8, alpha=0.6)
+
+        # 통로선: G/R에 닿는 간선은 숨김(시작 프레임 가독성)
+        for u, v in G.edges():
+            cu = G.nodes[u]["ch"]; cv = G.nodes[v]["ch"]
+            if cu in {"G","R"} or cv in {"G","R"}:
+                continue
+            ui, uj = G.nodes[u]["ij"]; vi, vj = G.nodes[v]["ij"]
+            ax.plot([uj+0.5, vj+0.5], [ui+0.5, vi+0.5], linewidth=1.2, alpha=0.35, color="k")
+
+        # 차량 (이동 + 정지 세그먼트)
+        for seg in segments:
+            t0, t1 = seg["t0"], seg["t1"]
+            if t0 <= t <= t1:
+                ui, uj, vi, vj = seg["ui"], seg["uj"], seg["vi"], seg["vj"]
+                a = (t - t0) / max(1e-9, (t1 - t0))
+                ci = ui + a*(vi-ui); cj = uj + a*(vj-uj)
+                circ = plt.Circle((cj+0.5, ci+0.5), 0.28, alpha=0.95,
+                                  facecolor=(0.20,0.40,1.00), edgecolor="black", linewidth=0.6)
+                ax.add_patch(circ)
+                ax.text(cj+0.5, ci+0.2, f"{seg['vid']}", ha='center', va='top', fontsize=8)
+
+        # 프레임 캡처
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        img = Image.open(buf).convert("RGBA").copy().convert("P", palette=Image.ADAPTIVE)
+        buf.close(); plt.close(fig)
+        frames.append(img)
+        t += dt
+
+    if not frames:
+        fig = plt.figure(figsize=(6,6)); plt.title(f"{fid} (no frames)")
+        buf = io.BytesIO(); plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0); img0 = Image.open(buf).convert("RGBA").copy().convert("P", palette=Image.ADAPTIVE)
+        buf.close(); plt.close(fig); frames.append(img0)
+
+    frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=int(dt*1000), loop=0)
+
+def render_combined_gif(floors, traj_dict, occ_dict, sim_time, dt, out_path):
+    """B1, B2를 위/아래로 결합한 하나의 GIF 생성"""
+    G1, _ = floors["B1"]
+    G2, _ = floors["B2"]
+    coords1 = [G1.nodes[n]["ij"] for n in G1.nodes]
+    coords2 = [G2.nodes[n]["ij"] for n in G2.nodes]
+    max_i1 = max(i for i, j in coords1)
+    max_j1 = max(j for i, j in coords1)
+    max_i2 = max(i for i, j in coords2)
+    max_j2 = max(j for i, j in coords2)
+    
+    offset_y = max_i1 + 4  # B2를 아래로 내리는 오프셋
+    frames = []
+    t = 0.0
+
+    while t <= sim_time + 1e-6:
+        fig = plt.figure(figsize=(8, 12))
+        ax = plt.gca()
+        ax.set_aspect("equal")
+        ax.set_xlim(-0.5, max(max_j1, max_j2) + 1.5)
+        ax.set_ylim(max_i1 + max_i2 + 8, -0.5)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"Combined Simulation (t={int(t)}s)")
+
+        def draw_floor(G, occ, traj, offset, label):
+            for n in G.nodes:
+                i, j = G.nodes[n]["ij"]
+                i += offset
+                base = G.nodes[n]["ch"]
+                occupied_now = False
+                if base in {"G","R"}:
+                    for (a,b) in occ.get(n, []):
+                        if a <= t <= b:
+                            occupied_now = True
+                            break
+                chp = "R" if occupied_now else base
+                if chp == "0": fc=(0.82,0.86,1.00)
+                elif chp == "G": fc=(0.85,1.00,0.85)
+                elif chp == "R": fc=(1.00,0.85,0.85)
+                else: fc=(1,1,1)
+                ax.add_patch(plt.Rectangle((j,i),1,1,facecolor=fc,edgecolor='0.85',linewidth=0.8))
+                ax.text(j+0.5,i+0.55,base,ha="center",va="center",fontsize=8,alpha=0.6)
+
+            for u,v in G.edges():
+                cu,cv=G.nodes[u]["ch"],G.nodes[v]["ch"]
+                if cu in {"G","R"} or cv in {"G","R"}: continue
+                ui,uj=G.nodes[u]["ij"]; vi,vj=G.nodes[v]["ij"]
+                ui+=offset; vi+=offset
+                ax.plot([uj+0.5,vj+0.5],[ui+0.5,vi+0.5],linewidth=1.2,alpha=0.35,color="k")
+            
+            # 차량
+            for seg in traj:
+                t0,t1=seg["t0"],seg["t1"]
+                if t0 <= t <= t1:
+                    ui,uj,vi,vj = seg["ui"],seg["uj"],seg["vi"],seg["vj"]
+                    ui+=offset; vi+=offset
+                    a = (t-t0)/max(1e-9,(t1-t0))
+                    ci=ui+a*(vi-ui); cj=uj+a*(vj-uj)
+                    circ=plt.Circle((cj+0.5,ci+0.5),0.28,alpha=0.95,
+                                    facecolor=(0.20,0.40,1.00),edgecolor="black",linewidth=0.6)
+                    ax.add_patch(circ)
+                    ax.text(cj+0.5,ci+0.2,f"{seg['vid']}",ha='center',va='top',fontsize=8)
+            
+            ax.text(0, offset-1.5, f"Floor {label}", fontsize=12, weight='bold', color='black')
+
+        draw_floor(G1, occ_dict["B1"], traj_dict["B1"], 0, "B1")
+        draw_floor(G2, occ_dict["B2"], traj_dict["B2"], offset_y, "B2")
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        img = Image.open(buf).convert("RGBA").copy().convert("P", palette=Image.ADAPTIVE)
+        buf.close(); plt.close(fig)
+        frames.append(img)
+        t += dt
+
+    frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=int(dt*1000), loop=0)
+    print(f"[ok] saved {out_path}")
+    
+# ===== 메인 =====
+def build_floors():
+    G1 = build_grid_graph(ASCII_MAP)
+    G2 = build_grid_graph(ASCII_MAP)
+
+    # 좌/우 최상단 '0'을 entrance로
+    def pick_leftmost_zero(G):
+        zs = [(n, G.nodes[n]["ij"]) for n in find_nodes(G, "0")]
+        zs.sort(key=lambda x: (x[1][0], x[1][1]))
+        return zs[0][0] if zs else None
+
+    def pick_rightmost_zero(G):
+        zs = [(n, G.nodes[n]["ij"]) for n in find_nodes(G, "0")]
+        zs.sort(key=lambda x: (x[1][0], -x[1][1]))
+        return zs[0][0] if zs else None
+
+    B1_entr = pick_leftmost_zero(G1)
+    B2_entr = pick_rightmost_zero(G2)
+    return {"B1": (G1, B1_entr), "B2": (G2, B2_entr)}
+
+def arrival_process(env, tower, logs):
+    env.process(arrival(env, tower, logs))
+
+def main():
+    env = simpy.Environment()
+    floors = build_floors()
+
+    # 시작 Map 레이아웃 스냅샷
+    # for fid, (G, _) in floors.items():
+    #     debug_dump_floor(fid, G)
+    #     save_layout_png(fid, G, out_path=f"{fid}_layout_debug.png")
+
+    tower = ControlTower(env, floors)
+    logs = []
+    logs.append(f"[T={env.now:6.1f}] [TOWER] 초기 R={sum(len(find_nodes(G,'R')) for G,_ in floors.values())}, 초기 G={sum(len(find_nodes(G,'G')) for G,_ in floors.values())}")
+    arrival_process(env, tower, logs)
+
+    print("=== Parking Simulation Start ===")
+    env.run(until=SIM_TIME)
+    print("=== Simulation End ===")
+    
+    render_combined_gif(floors, tower.traj, tower.occ, env.now, DT, "combined_simulation.gif")
+
+    # GIF 생성 (점유구간 전달)
+    # for fid, floor in floors.items():
+    #     out_path = f"{fid}_simulation.gif"
+    #     render_floor_gif(fid, floor, tower.traj[fid], env.now, DT, out_path, occ=tower.occ[fid])
+    #     print(f"[ok] saved {out_path}")
+
+if __name__ == "__main__":
+    main()
+
+
