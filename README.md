@@ -50,29 +50,6 @@
   - 상단: **Floor B1**
   - 하단: **Floor B2** (렌더링 시 B1 아래로 오프셋)
 
-### 🧠 핵심 제어 로직 (요약)
-- **중앙 관제(ControlTower)**
-  - `ReservationTable`을 통해 시간창 단위로 **엣지/노드/커넥터 예약**을 관리합니다.
-    - `book_edge[(fid, ek)]`, `book_node[(fid, node)]`, `book_conn`에 `(t0, t1, vid)`로 기록
-  - 주차 스팟은 **SimPy Resource(capacity=1)**로 **물리적 락**을 겁니다.  
-    같은 스팟에 동시 진입 불가 (`get_spot_lock(fid, spot)`).
-  - 스팟 선점 집합(`claimed`)과 **점유 시간대 리스트(`occ`)**로 **논리적 중복**도 방지합니다.
-- **경로 계획 (A*)**
-  - 진입: `build_composite_path_to_spot(fid_dest, spot)`
-    - B1이면 바로 B1 경로, B2면 **B1→커넥터(XFER)→B2**로 세그먼트 합성
-  - 출차: `build_composite_path_to_exit(fid_src, spot)`
-    - B2 출차 시 **B2 출구→커넥터→B1 출구**로 합성
-  - 실제 A* 탐색은 `build_route_subgraph`로 차선(`-`,`|`)·출입구(`0`)만 허용한 **서브그래프**에서 수행
-- **예약·커밋**
-  - 각 세그먼트(노드 u→v, `dur`)에 대해 `(t0,t1)` 창을 먼저 **컨플릭트 체크**한 뒤,
-  - 통과 시 `commit_edge/commit_node/commit_connector`로 **원자적 커밋**하고,
-  - 시각화용 궤적(`traj[fid]`)에 `(ui,uj)→(vi,vj), t0,t1, exiting`을 기록합니다.
-
-### 🔁 재탐색·대기 전략
-- 경로가 없거나 예약 충돌이면 **REPLAN_DELAY** 동안 **주차칸 정지 세그먼트**를 추가로 기록하여  
-  화면에서 차량이 “기다리는” 상태가 자연스럽게 보이도록 합니다.
-- 스팟이 이미 선점되었거나 예약이 막힐 경우, **선점 해제 → 재검색** 루프를 수행합니다.
-
 ### ⚠️ 주의 사항
 - 경로 허용 규칙은 **기호와 방향성**에 따라 제한됩니다.  
   예를 들어, `G/R`는 **수평('-') 간선과만 연결**되고, `|`는 **수직 통과만 허용**합니다.  
