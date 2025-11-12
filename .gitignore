@@ -1,0 +1,22 @@
+# 가상환경 / 빌드 / 캐시 폴더 제외
+venv/
+__pycache__/
+build/
+dist/
+
+# OS 관련
+.DS_Store
+Thumbs.db
+
+# IDE 설정 파일
+.vscode/
+.idea/
+
+# 로그, 임시파일
+*.log
+*.tmp
+*.swp
+
+# 비밀 정보
+.env
+config.json
